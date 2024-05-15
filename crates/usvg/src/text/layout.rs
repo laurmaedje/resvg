@@ -13,7 +13,7 @@ use strict_num::NonZeroPositiveF32;
 use tiny_skia_path::{NonZeroRect, Transform};
 use unicode_script::UnicodeScript;
 
-use crate::text::fontdb::DatabaseExt;
+use crate::text::FontProviderExt;
 use crate::tree::{BBox, IsValidLength};
 use crate::{
     AlignmentBaseline, ApproxZeroUlps, BaselineShift, DominantBaseline, Fill, FillRule, Font,
@@ -213,7 +213,7 @@ pub(crate) fn layout_text(
             if !fonts_cache.contains_key(&span.font) {
                 if let Some(font) = font_provider
                     .find_font(&span.font)
-                    .and_then(|id| font_provider.fontdb().load_font(id))
+                    .and_then(|id| font_provider.load_font(id))
                 {
                     fonts_cache.insert(span.font.clone(), Arc::new(font));
                 }
@@ -1212,7 +1212,7 @@ pub(crate) fn shape_text(
         if let Some(c) = missing {
             let fallback_font = match font_provider
                 .find_fallback_font(c, used_fonts[0], &used_fonts)
-                .and_then(|id| font_provider.fontdb().load_font(id))
+                .and_then(|id| font_provider.load_font(id))
             {
                 Some(v) => Arc::new(v),
                 None => break 'outer,
@@ -1283,88 +1283,85 @@ fn shape_text_with_font(
     apply_kerning: bool,
     font_provider: &dyn FontProvider,
 ) -> Option<Vec<Glyph>> {
-    font_provider.fontdb().with_face_data(
-        font.id,
-        |font_data, face_index| -> Option<Vec<Glyph>> {
-            let rb_font = rustybuzz::Face::from_slice(font_data, face_index)?;
+    font_provider.with_face_data(font.id, |font_data, face_index| -> Option<Vec<Glyph>> {
+        let rb_font = rustybuzz::Face::from_slice(font_data, face_index)?;
 
-            let bidi_info = unicode_bidi::BidiInfo::new(text, Some(unicode_bidi::Level::ltr()));
-            let paragraph = &bidi_info.paragraphs[0];
-            let line = paragraph.range.clone();
+        let bidi_info = unicode_bidi::BidiInfo::new(text, Some(unicode_bidi::Level::ltr()));
+        let paragraph = &bidi_info.paragraphs[0];
+        let line = paragraph.range.clone();
 
-            let mut glyphs = Vec::new();
+        let mut glyphs = Vec::new();
 
-            let (levels, runs) = bidi_info.visual_runs(paragraph, line);
-            for run in runs.iter() {
-                let sub_text = &text[run.clone()];
-                if sub_text.is_empty() {
-                    continue;
-                }
-
-                let ltr = levels[run.start].is_ltr();
-                let hb_direction = if ltr {
-                    rustybuzz::Direction::LeftToRight
-                } else {
-                    rustybuzz::Direction::RightToLeft
-                };
-
-                let mut buffer = rustybuzz::UnicodeBuffer::new();
-                buffer.push_str(sub_text);
-                buffer.set_direction(hb_direction);
-
-                let mut features = Vec::new();
-                if small_caps {
-                    features.push(rustybuzz::Feature::new(
-                        rustybuzz::Tag::from_bytes(b"smcp"),
-                        1,
-                        ..,
-                    ));
-                }
-
-                if !apply_kerning {
-                    features.push(rustybuzz::Feature::new(
-                        rustybuzz::Tag::from_bytes(b"kern"),
-                        0,
-                        ..,
-                    ));
-                }
-
-                let output = rustybuzz::shape(&rb_font, &features, buffer);
-
-                let positions = output.glyph_positions();
-                let infos = output.glyph_infos();
-
-                for i in 0..output.len() {
-                    let pos = positions[i];
-                    let info = infos[i];
-                    let idx = run.start + info.cluster as usize;
-
-                    let start = info.cluster as usize;
-
-                    let end = if ltr {
-                        i.checked_add(1)
-                    } else {
-                        i.checked_sub(1)
-                    }
-                    .and_then(|last| infos.get(last))
-                    .map_or(sub_text.len(), |info| info.cluster as usize);
-
-                    glyphs.push(Glyph {
-                        byte_idx: ByteIndex::new(idx),
-                        cluster_len: end.checked_sub(start).unwrap_or(0), // TODO: can fail?
-                        text: sub_text[start..end].to_string(),
-                        id: GlyphId(info.glyph_id as u16),
-                        dx: pos.x_offset,
-                        dy: pos.y_offset,
-                        width: pos.x_advance,
-                        font: font.clone(),
-                    });
-                }
+        let (levels, runs) = bidi_info.visual_runs(paragraph, line);
+        for run in runs.iter() {
+            let sub_text = &text[run.clone()];
+            if sub_text.is_empty() {
+                continue;
             }
 
-            Some(glyphs)
-        },
-    )?
+            let ltr = levels[run.start].is_ltr();
+            let hb_direction = if ltr {
+                rustybuzz::Direction::LeftToRight
+            } else {
+                rustybuzz::Direction::RightToLeft
+            };
+
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.push_str(sub_text);
+            buffer.set_direction(hb_direction);
+
+            let mut features = Vec::new();
+            if small_caps {
+                features.push(rustybuzz::Feature::new(
+                    rustybuzz::Tag::from_bytes(b"smcp"),
+                    1,
+                    ..,
+                ));
+            }
+
+            if !apply_kerning {
+                features.push(rustybuzz::Feature::new(
+                    rustybuzz::Tag::from_bytes(b"kern"),
+                    0,
+                    ..,
+                ));
+            }
+
+            let output = rustybuzz::shape(&rb_font, &features, buffer);
+
+            let positions = output.glyph_positions();
+            let infos = output.glyph_infos();
+
+            for i in 0..output.len() {
+                let pos = positions[i];
+                let info = infos[i];
+                let idx = run.start + info.cluster as usize;
+
+                let start = info.cluster as usize;
+
+                let end = if ltr {
+                    i.checked_add(1)
+                } else {
+                    i.checked_sub(1)
+                }
+                .and_then(|last| infos.get(last))
+                .map_or(sub_text.len(), |info| info.cluster as usize);
+
+                glyphs.push(Glyph {
+                    byte_idx: ByteIndex::new(idx),
+                    cluster_len: end.checked_sub(start).unwrap_or(0), // TODO: can fail?
+                    text: sub_text[start..end].to_string(),
+                    id: GlyphId(info.glyph_id as u16),
+                    dx: pos.x_offset,
+                    dy: pos.y_offset,
+                    width: pos.x_advance,
+                    font: font.clone(),
+                });
+            }
+        }
+
+        Some(glyphs)
+    })?
 }
 
 /// An iterator over glyph clusters.
